@@ -3,18 +3,19 @@ package main
 import (
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/google/uuid"
 )
 
 func main() {
-	hub := &Hub{
-		clients: make(map[*Client]bool),
-		broadcast: make(chan *Message),
-		register: make(chan *Client),
-		unregister: make(chan *Client),
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "redis://localhost:6379"
 	}
-	go hub.Run()
+
+	hub := NewRedisHub(redisURL)
+	defer hub.Close()
 
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -22,14 +23,26 @@ func main() {
 			log.Printf("Error upgrading to WebSocket: %v", err)
 			return
 		}
+
 		clientID := uuid.New().String()
 		client := &Client{
-			id: clientID,
-			hub: hub,
+			id:   clientID,
+			hub:  hub,
 			conn: conn,
 			send: make(chan []byte, 256),
 		}
-		hub.register <- client
+
+		if err := hub.RegisterClient(clientID); err != nil {
+			log.Printf("Error registering client: %v", err)
+			conn.Close()
+			return
+		}
+
+		hub.SetClientConnection(clientID, map[string]interface{}{
+			"connected_at": "now",
+			"ip":           r.RemoteAddr,
+		})
+
 		go client.readPump()
 		go client.writePump()
 	})

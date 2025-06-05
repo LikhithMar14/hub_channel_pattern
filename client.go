@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log"
 	"time"
@@ -11,9 +12,15 @@ import (
 
 type Client struct {
 	id   string
-	hub  *Hub
+	hub  *RedisHub
 	conn *websocket.Conn
 	send chan []byte
+}
+
+type MessageBroadcaster struct {
+	hub    *RedisHub
+	client *Client
+	ctx    context.Context
 }
 
 var upgrader = websocket.Upgrader{
@@ -24,13 +31,45 @@ var upgrader = websocket.Upgrader{
 const (
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 1024 // Made consistent with ReadLimit
+	maxMessageSize = 1024
 	writeWait      = 10 * time.Second
 )
 
+func NewMessageBroadcaster(hub *RedisHub, client *Client) *MessageBroadcaster {
+	return &MessageBroadcaster{
+		hub:    hub,
+		client: client,
+		ctx:    context.Background(),
+	}
+}
+
+func (mb *MessageBroadcaster) listenForMessages() {
+	pubsub := mb.hub.client.Subscribe(mb.ctx, "broadcast")
+	defer pubsub.Close()
+
+	ch := pubsub.Channel()
+	for msg := range ch {
+		var broadcastMsg Message
+		if err := json.Unmarshal([]byte(msg.Payload), &broadcastMsg); err != nil {
+			log.Printf("Error unmarshaling broadcast message: %v", err)
+			continue
+		}
+
+		if broadcastMsg.ClientID != mb.client.id {
+			select {
+			case mb.client.send <- []byte(broadcastMsg.Message):
+			default:
+				close(mb.client.send)
+				return
+			}
+		}
+	}
+}
+
 func (c *Client) readPump() {
 	defer func() {
-		c.hub.unregister <- c
+		c.hub.UnregisterClient(c.id)
+		c.hub.RemoveClientConnection(c.id)
 		c.conn.Close()
 	}()
 
@@ -38,11 +77,15 @@ func (c *Client) readPump() {
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		c.hub.SetClientHeartbeat(c.id)
 		return nil
 	})
 
+	mb := NewMessageBroadcaster(c.hub, c)
+	go mb.listenForMessages()
+
 	for {
-		_, text, err := c.conn.ReadMessage()
+		messageType, text, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("Error reading message: %v", err)
@@ -50,23 +93,21 @@ func (c *Client) readPump() {
 			break
 		}
 
+		log.Printf("Received raw message: %d", messageType)
 		log.Printf("Received raw message: %s", text)
 
-		// Check if the message is valid JSON by looking at the first character
 		trimmed := bytes.TrimSpace(text)
 		if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
-			// Attempt to decode as JSON
 			msg := &Message{}
 			reader := bytes.NewReader(text)
 			decoder := json.NewDecoder(reader)
 
 			if err := decoder.Decode(msg); err != nil {
 				log.Printf("Invalid JSON format: %v", err)
-				// Treat as plain text message
-				c.hub.broadcast <- &Message{
+				c.hub.BroadcastMessage(&Message{
 					ClientID: c.id,
 					Message:  string(text),
-				}
+				})
 				continue
 			}
 
@@ -75,14 +116,13 @@ func (c *Client) readPump() {
 			}
 
 			log.Printf("Decoded JSON message: %+v", msg)
-			c.hub.broadcast <- msg
+			c.hub.BroadcastMessage(msg)
 		} else {
-			// Handle as plain text message
 			log.Printf("Received plain text message from client %s", c.id)
-			c.hub.broadcast <- &Message{
+			c.hub.BroadcastMessage(&Message{
 				ClientID: c.id,
 				Message:  string(text),
-			}
+			})
 		}
 	}
 }
@@ -116,6 +156,7 @@ func (c *Client) writePump() {
 				log.Printf("Error sending ping: %v", err)
 				return
 			}
+			c.hub.SetClientHeartbeat(c.id)
 		}
 	}
 }
