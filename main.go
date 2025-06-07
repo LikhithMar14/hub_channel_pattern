@@ -31,7 +31,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		log.Println("WebSocket upgrade error:", err)
 		return
 	}
-
+	// we repeated this logic twice becuase if there are differnt types of clients let's say premium user and a normal user one can send huge data like pictures and stuff and
+	// other can only send messages so we need to handle both cases
 
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
