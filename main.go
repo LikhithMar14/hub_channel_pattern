@@ -3,13 +3,16 @@ package main
 import (
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 var (
-	upgrader     = websocket.Upgrader{
+	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
 	}
 	hubManager = NewHubManager()
 )
@@ -29,10 +32,15 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hub := hubManager.GetHub(auctionId)
-	if hub == nil {
-		hub = hubManager.AddHub(auctionId)
-	}
+
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	hub := hubManager.GetOrCreateHub(auctionId)
 
 	client := &Client{
 		id:   senderId,
@@ -43,18 +51,48 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	hub.register <- client
 
-
 	go client.writePump()
 	go client.readPump()
 }
 
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	stats := hubManager.GetStats()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(stats))
+}
+
 func main() {
 	http.HandleFunc("/ws", wsHandler)
+	http.HandleFunc("/health", healthHandler)
+	http.HandleFunc("/stats", statsHandler)
 
 	addr := ":8080"
 	log.Printf("Server started at http://localhost%s", addr)
-	err := http.ListenAndServe(addr, nil)
-	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+	
+		for range ticker.C {
+			hubManager.CleanupInactiveHubs()
+		}
+	}()
+	
+
+	server := &http.Server{
+		Addr:         addr,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatal("ListenAndServe:", err)
 	}
 }
