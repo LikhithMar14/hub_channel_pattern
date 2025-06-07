@@ -3,52 +3,58 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
 
-	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
-func main() {
-	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
-		redisURL = "redis://localhost:6379"
+var (
+	upgrader     = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	hubManager = NewHubManager()
+)
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	auctionId := r.URL.Query().Get("auctionId")
+	senderId := r.URL.Query().Get("senderId")
+
+	if auctionId == "" || senderId == "" {
+		http.Error(w, "auctionId and senderId are required", http.StatusBadRequest)
+		return
 	}
 
-	hub := NewRedisHub(redisURL)
-	defer hub.Close()
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("WebSocket upgrade error:", err)
+		return
+	}
 
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Printf("Error upgrading to WebSocket: %v", err)
-			return
-		}
+	hub := hubManager.GetHub(auctionId)
+	if hub == nil {
+		hub = hubManager.AddHub(auctionId)
+	}
 
-		clientID := uuid.New().String()
-		client := &Client{
-			id:   clientID,
-			hub:  hub,
-			conn: conn,
-			send: make(chan []byte, 256),
-		}
+	client := &Client{
+		id:   senderId,
+		hub:  hub,
+		conn: conn,
+		send: make(chan []byte, 256),
+	}
 
-		if err := hub.RegisterClient(clientID); err != nil {
-			log.Printf("Error registering client: %v", err)
-			conn.Close()
-			return
-		}
+	hub.register <- client
 
-		hub.SetClientConnection(clientID, map[string]interface{}{
-			"connected_at": "now",
-			"ip":           r.RemoteAddr,
-		})
 
-		go client.readPump()
-		go client.writePump()
-	})
+	go client.writePump()
+	go client.readPump()
+}
 
-	log.Println("Server is running on port 8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatal("Error starting server: ", err)
+func main() {
+	http.HandleFunc("/ws", wsHandler)
+
+	addr := ":8080"
+	log.Printf("Server started at http://localhost%s", addr)
+	err := http.ListenAndServe(addr, nil)
+	if err != nil {
+		log.Fatal("ListenAndServe: ", err)
 	}
 }
